@@ -86,3 +86,12 @@ def register_all_platforms():
         logger.info("Registered platform: moore_threads (musa)")
     except Exception as e:
         logger.debug("MUSA platform not registered: %s", e)
+
+    # Google TPU — imports without torch_tpu; the module falls back to a dummy device
+    # shim so a CPU-only Ray driver process can still resolve the platform.
+    try:
+        from verl_hardware_plugin.platforms import platform_tpu  # noqa: F401
+
+        logger.info("Registered platform: google (tpu)")
+    except Exception as e:
+        logger.debug("TPU platform not registered: %s", e)
