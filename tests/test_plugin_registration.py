@@ -360,6 +360,22 @@ class TestPlatformRegistration:
             entered = True
         assert entered
 
+    def test_supa_detection_with_env(self):
+        from verl.plugin.platform.platform_manager import _detect_platform_name
+        from verl_hardware_plugin.platforms.platform_supa import PlatformSupa  # noqa: F401
+
+        with _fresh_registries():
+            with mock.patch.dict(os.environ, {"VERL_PLATFORM": "biren"}):
+                assert _detect_platform_name() == "biren"
+
+    def test_supa_device_and_vendor_names(self):
+        from verl_hardware_plugin.platforms.platform_supa import PlatformSupa
+
+        platform = PlatformSupa()
+        assert platform.device_name == "supa"
+        assert platform.vendor_name == "biren"
+        assert platform.communication_backend_name() == "bccl"
+
 
 class TestEngineRegistration:
     """Verify that engine classes register correctly."""
