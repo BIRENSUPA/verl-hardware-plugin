@@ -70,10 +70,14 @@ verl (main framework)
             ├── EngineRegistry.register(device="gcu", vendor="enflame")
             ├── EngineRegistry.register(device="cuda", vendor="iluvatar")
             ├── EngineRegistry.register(device="musa", vendor="moore_threads")
-            └── EngineRegistry.register(device="supa", vendor="biren")
+            ├── EngineRegistry.register(device="tpu", vendor="google")
+            ├── EngineRegistry.register(device="supa", vendor="biren")
+            │
+            └── RolloutReplicaRegistry.register("vllm")  → TPUvLLMReplica on TPU
 ```
 
-FlagOS registers engines on the CUDA platform rather than a separate platform. TPU currently registers a platform but no training engine in this plugin.
+FlagOS registers engines on the CUDA platform rather than a separate platform. The `vllm` rollout
+loader returns the TPU rollout on TPU and verl's own vLLM rollout on every other platform.
 
 The plugin uses verl's decorator-based registration:
 - `@PlatformRegistry.register(platform="vendor_name")` for platform classes
