@@ -5,13 +5,15 @@ Pick one with `actor_rollout_ref.rollout.checkpoint_engine.backend`:
 
 | Backend | How the weights travel |
 |---------|------------------------|
-| `tpu` | Trainer rank 0 gathers the full model and puts it in the Ray object store. Every rollout worker then pulls it and cuts out its own shard. |
-| `raiden` | The trainer chips send straight to the rollout chips over the network with [tpu-sync](https://github.com/google/tpu-sync) (Raiden). Each rollout chip receives only its own tensor-parallel shard. |
+| `ray-plasma-store` | Trainer rank 0 gathers the full model and puts it in the Ray object store. Every rollout worker then pulls it and cuts out its own shard. |
+| `tpu-sync` | The trainer chips send straight to the rollout chips over the network with [tpu-sync](https://github.com/google/tpu-sync) (Raiden). Each rollout chip receives only its own tensor-parallel shard. |
 
-`raiden` is faster: the weights skip the round trip through the object store, and no rollout worker
+`tpu-sync` is faster: the weights skip the round trip through the object store, and no rollout worker
 receives the whole model.
 
-## How a `raiden` sync works
+The former names of the two backends, `tpu` and `raiden`, are still accepted and print a deprecation warning (`FutureWarning`).
+
+## How a `tpu-sync` sync works
 
 The driver runs each sync (`update_raiden_weights`, which replaces `CheckpointEngineManager.update_weights`
 for this backend):
@@ -35,8 +37,8 @@ for this backend):
 - `tpu-sync-torch` installed on every trainer and rollout host, built for the installed `torch-tpu`.
   The tpu-sync torch extension is ABI-locked to the `torch-tpu` build it was compiled against. A
   mismatched pair crashes in the first transfer. The backend is tested with `torch-tpu`
-  `0.1.2.dev20261006000518` and `tpu-sync-torch` `0.0.1.dev20261006025601` (image
-  `us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261006-tsync1006`).
+  `0.1.2.dev20261006000518` and `tpu-sync-torch` `0.0.1.dev20261006025601` (the versions in the
+  `Dockerfile` of verl's [`examples/tpu/grpo`](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo)).
   - `WeightSynchronizer.unbind_weights()` needs `tpu-sync-torch` `0.0.1.dev20261006025601` or newer. With
     an older build (e.g. `0.0.1.dev20261001132139`) the trainer logs a warning once and falls back to
     destroying and re-creating its synchronizer every sync, which adds a few seconds per sync for an 8B
@@ -48,15 +50,15 @@ for this backend):
 ## Configuration
 
 ```bash
-actor_rollout_ref.rollout.checkpoint_engine.backend=raiden
+actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 # Optional, see the table below:
-+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.parallelism=8
-+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.verify_parity=True
-+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.release_buffers_after_sync=True
++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync.parallelism=8
++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync.verify_parity=True
++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync.release_buffers_after_sync=True
 ```
 
-| Option (`engine_kwargs.raiden.*`) | Default | Description |
-|-----------------------------------|---------|-------------|
+| Option (`engine_kwargs.tpu-sync.*`) | Default | Description |
+|-------------------------------------|---------|-------------|
 | `parallelism` | `8` | Parallel transfer streams per worker. |
 | `verify_parity` | `False` | After every sync, compare weight norms between trainer and rollout and log the result. Adds a pass over all weights on both sides, so it is meant for bring-up. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The environment variable `VERL_RAIDEN_RELEASE_BUFFERS` overrides the option on the trainer workers. |
@@ -86,11 +88,11 @@ verl's vLLM server does not yet pass back from `collective_rpc`. Until it does, 
 On any host, without tpu-sync, vLLM or a TPU:
 
 ```bash
-pytest tests/accelerators/tpu/test_raiden_checkpoint_engine.py -v
+pytest tests/accelerators/tpu/test_tpu_sync_checkpoint_engine.py -v
 ```
 
-On TPU, set `VERL_LOGGING_LEVEL=INFO` and `SAGEMAKER_CONTAINER_LOG_LEVEL=INFO` in the job's `env_vars`, as
-in the [vLLM Rollout](./rollout.md) example. Every sync then logs its phase times. For example, from a
+On TPU, set `VERL_LOGGING_LEVEL=INFO` and `SAGEMAKER_CONTAINER_LOG_LEVEL=INFO` in the job's `env_vars` (see
+[vLLM Rollout](./rollout.md#run)). Every sync then logs its phase times. For example, from a
 Qwen3-0.6B run with one v6e-8 slice for training and one for rollout:
 
 ```text
@@ -120,5 +122,5 @@ Errors, such as a parity mismatch, are always logged.
 
 - [User Guide](./README.md)
 - [vLLM Rollout](./rollout.md)
-- For developers: `verl_hardware_plugin/accelerators/tpu/engines/raiden_checkpoint_engine.py` (trainer and driver side)
+- For developers: `verl_hardware_plugin/accelerators/tpu/engines/tpu_sync_checkpoint_engine.py` (trainer and driver side)
   and `verl_hardware_plugin/accelerators/tpu/rollout/tpu_raiden.py` (rollout side).

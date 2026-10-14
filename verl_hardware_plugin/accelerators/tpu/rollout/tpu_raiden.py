@@ -4,8 +4,8 @@
 """vLLM worker extension that receives the trainer's weights over Raiden (tpu-sync) on TPU.
 
 ``TPUvLLMHttpServer`` passes this class to vLLM as ``worker_extension_cls`` when
-``actor_rollout_ref.rollout.checkpoint_engine.backend=raiden``. The driver
-(``update_raiden_weights`` in ``verl_hardware_plugin.accelerators.tpu.engines.raiden_checkpoint_engine``) calls its
+``actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync``. The driver
+(``update_raiden_weights`` in ``verl_hardware_plugin.accelerators.tpu.engines.tpu_sync_checkpoint_engine``) calls its
 methods on every vLLM worker through ``collective_rpc``:
 
 1. ``init_raiden_sync_on_worker``: allocate TP-sharded receive buffers for the tensors the trainer
@@ -26,7 +26,7 @@ import ray
 import torch
 
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
-from verl_hardware_plugin.accelerators.tpu.engines import raiden_checkpoint_engine as raiden
+from verl_hardware_plugin.accelerators.tpu.engines import tpu_sync_checkpoint_engine as raiden
 from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import get_ray_weight_registry
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_checkpoint_engine import (
     _get_parent_module,
@@ -79,7 +79,7 @@ def _sampler_sharding(name: str, global_shape: list[int], tp_size: int) -> tuple
 class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
     """vLLM Worker Extension for Google Cloud TPU with Raiden P2P weight synchronization.
 
-    Workloads using the 'raiden' checkpoint engine for high-speed TPU weight sync
+    Workloads using the 'tpu-sync' checkpoint engine for high-speed TPU weight sync
     must use this worker extension to bind TPU model tensors with WeightSynchronizer
     and orchestrate dynamic zero-copy H2D DMA transfers during rollout.
     """
