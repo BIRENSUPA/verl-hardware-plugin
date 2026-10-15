@@ -240,23 +240,46 @@ def unwrap_metadata(val: Any) -> Any:
     return val
 
 
-def synchronize_tpu_loss(loss: torch.Tensor) -> None:
-    """Materialize the forward graph loss without blocking to split XLA forward and backward compilation passes."""
-    if loss.device.type != "tpu":
+def tpu_synchronize(
+    tensors: Optional[torch.Tensor] = None,
+    *,
+    wait: bool = True,
+    strict: bool = False,
+) -> None:
+    """Materialize and synchronize pending TPU operations (for ``tensors`` or the whole device).
+
+    Args:
+        tensors: Optional tensor (e.g. ``loss``) to materialize; ``None`` synchronizes the whole TPU device.
+        wait: Wait for device execution to complete when ``True``; dispatch asynchronously when ``False``.
+        strict: Raise ``RuntimeError`` if ``torch_tpu`` cannot synchronize instead of logging a warning.
+    """
+    if isinstance(tensors, torch.Tensor) and tensors.device.type != "tpu":
         return
     try:
-        from torch_tpu._internal.sync import synchronize
+        from torch_tpu._internal import sync as torch_tpu_sync
 
-        synchronize(loss, wait=False)
+        if tensors is None:
+            torch_tpu_sync.synchronize(wait=wait)
+        else:
+            torch_tpu_sync.synchronize(tensors, wait=wait)
         return
-    except ImportError:
-        pass
+    except ImportError as e:
+        if strict:
+            raise RuntimeError(f"TPU synchronization failed: {e}") from e
+    except Exception as e:
+        if strict:
+            raise RuntimeError(f"TPU synchronization failed: {e}") from e
+        logger.warning(f"Could not synchronize via torch_tpu: {e}")
+        return
+
     tpu_mod = getattr(torch, "tpu", None)
     if tpu_mod is not None and hasattr(tpu_mod, "synchronize"):
         try:
             tpu_mod.synchronize()
         except Exception as e:
-            logger.debug("torch.tpu.synchronize() failed during loss sync: %s", e)
+            if strict:
+                raise RuntimeError(f"TPU synchronization failed: {e}") from e
+            logger.debug("torch.tpu.synchronize() failed during TPU sync: %s", e)
 
 
 def tpu_eager_mode_context(mode: Optional[str]):
@@ -369,7 +392,9 @@ def tpu_torchtitan_config_overrides(*, use_simple_fsdp: bool = False):
 
     import verl.workers.engine.torchtitan.transformer_impl as tt_impl
 
-    default_spmd_backend = getattr(getattr(tt_impl, "ParallelismConfig", None), "spmd_backend", "partial_dtensor")
+    parallelism_cls = getattr(tt_impl, "ParallelismConfig", None)
+    spmd_field = getattr(parallelism_cls, "__dataclass_fields__", {}).get("spmd_backend")
+    default_spmd_backend = getattr(spmd_field, "default", getattr(parallelism_cls, "spmd_backend", "partial_dtensor"))
     if not isinstance(default_spmd_backend, str):
         default_spmd_backend = "partial_dtensor"
 
