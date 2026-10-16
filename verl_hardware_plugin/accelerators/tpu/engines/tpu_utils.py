@@ -3,18 +3,19 @@
 
 """TPU helper utilities for the TorchTitan training engine.
 
-Provides sequence-length bucketing, host-side metadata unwrapping, TorchTitan
-config overrides, packed-input padding, ``torch.compile(backend="tpu")`` Dynamo
-configuration, ``TPUSplashAttention``, ``SimpleFSDP`` wrapping, cross-rank
-micro-batch shape alignment, and ``DEFER_AND_FUSE`` eager-mode contexts for
-``torch_tpu`` training.
+Provides sequence-length bucketing, host-side metadata unwrapping, packed-input padding,
+``torch.compile(backend="tpu")`` Dynamo configuration, ``TPUSplashAttention``, the torchtitan TPU
+recipe that shards with ``SimpleFSDP``, cross-rank micro-batch shape alignment, and ``DEFER_AND_FUSE``
+eager-mode contexts for ``torch_tpu`` training.
 """
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
-from contextlib import contextmanager, nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -24,6 +25,7 @@ import torch.distributed
 import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict
+from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
@@ -38,6 +40,173 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 TPU_PADDED_VALUES_ATTR = "_tpu_padded_values"
 
 _DEFAULT_TPU_SEQ_BUCKET_SIZE = 256
+
+# Mapping from HuggingFace model_type to torchtitan model name.
+# Torchtitan models not mapped here:
+#   - flux: diffusion model, not applicable to verl's RL/SFT workflows
+#   - llama3_ft: fault-tolerant variant of llama3, same HF models (mapped via "llama")
+_HF_MODEL_TYPE_TO_TORCHTITAN_NAME = {
+    "qwen2": "qwen3",
+    "qwen3": "qwen3",
+    "qwen2_moe": "qwen3",
+    "qwen3_moe": "qwen3",
+    "llama": "llama3",
+    "llama4": "llama4",
+    "deepseek_v3": "deepseek_v3",
+    "gpt_oss": "gpt_oss",
+}
+
+# torchtitan TPU recipes whose ``parallelize_fn`` shards with SimpleFSDP when ``parallelism.use_simple_fsdp`` is set.
+_TPU_SIMPLE_FSDP_RECIPES = {
+    "qwen3": ("torchtitan.experiments.tpu.qwen3.infra.parallelize", "parallelize_qwen3"),
+    "llama3": ("torchtitan.experiments.tpu.llama3.infra.parallelize", "parallelize_llama"),
+}
+
+
+def create_noop_dataloader_config() -> Any:
+    """Create a no-op TorchTitan ``BaseDataLoader.Config`` when verl manages its own data loading."""
+    from torchtitan.components.data.loader import BaseDataLoader
+
+    class NoOpDataLoader(BaseDataLoader):
+        """A no-op dataloader for use when verl manages its own data loading.
+
+        Satisfies the BaseDataLoader interface required by torchtitan's Trainer
+        but does nothing. Its __iter__ yields nothing, and state_dict /
+        load_state_dict are no-ops.
+        """
+
+        @dataclass(kw_only=True, slots=True)
+        class Config(BaseDataLoader.Config):
+            pass
+
+        def __init__(self, **kwargs: Any):
+            pass
+
+        def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+            return iter([])
+
+        def state_dict(self) -> dict[str, Any]:
+            return {}
+
+        def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+            pass
+
+    return NoOpDataLoader.Config()
+
+
+def derive_torchtitan_name_and_flavor(hf_config: Any) -> tuple[str, str]:
+    """Derive torchtitan model name and flavor from a HuggingFace config.
+
+    The name is mapped from ``hf_config.model_type``. The flavor is found by
+    matching architecture parameters (dim, n_layers, vocab_size) against the
+    known flavors registered in the torchtitan model package.
+
+    Args:
+        hf_config: A HuggingFace AutoConfig object.
+
+    Returns:
+        A ``(name, flavor)`` tuple.
+
+    Raises:
+        ValueError: If model_type is unsupported or no matching flavor is found.
+    """
+    model_type = getattr(hf_config, "model_type", None)
+    if model_type is None:
+        raise ValueError("HuggingFace config does not have 'model_type' field")
+
+    name = _HF_MODEL_TYPE_TO_TORCHTITAN_NAME.get(model_type)
+    if name is None:
+        raise ValueError(
+            f"Cannot derive torchtitan model name from HF model_type '{model_type}'. "
+            f"Supported types: {list(_HF_MODEL_TYPE_TO_TORCHTITAN_NAME.keys())}."
+        )
+
+    # Import the model package and use model_registry to build each flavor's config.
+    # model_registry has sensible defaults for all optional params (attn_backend, etc.).
+    model_module = importlib.import_module(f"torchtitan.models.{name}")
+    model_registry = model_module.model_registry
+
+    # The configs dict name isn't derivable from the model name
+    # (e.g. gpt_oss -> gptoss_configs), so we find it by convention.
+    flavor_names = None
+    for attr, obj in vars(model_module).items():
+        if attr.endswith("_configs") and isinstance(obj, dict):
+            flavor_names = list(obj.keys())
+            break
+
+    if flavor_names is None:
+        raise ValueError(
+            f"Could not find model configs dict in torchtitan.models.{name}. "
+            f"Expected a dict attribute ending with '_configs'."
+        )
+
+    hidden_size = hf_config.hidden_size
+    num_layers = hf_config.num_hidden_layers
+    vocab_size = hf_config.vocab_size
+
+    for flavor_name in flavor_names:
+        cfg = model_registry(flavor_name).model
+        n_layers = getattr(cfg, "n_layers", None) or len(getattr(cfg, "layers", []))
+        if (
+            getattr(cfg, "dim", None) == hidden_size
+            and n_layers == num_layers
+            and getattr(cfg, "vocab_size", None) == vocab_size
+        ):
+            logger.info(
+                "Auto-derived torchtitan name=%r, flavor=%r from HF model_type=%r",
+                name,
+                flavor_name,
+                model_type,
+            )
+            return name, flavor_name
+
+    raise ValueError(
+        f"No matching torchtitan flavor found for model_type='{model_type}' "
+        f"(hidden_size={hidden_size}, num_hidden_layers={num_layers}, "
+        f"vocab_size={vocab_size}). "
+        f"Available flavors for '{name}': {flavor_names}."
+    )
+
+
+def enable_fsdp_gradient_division(model: nn.Module, dp_size: int) -> None:
+    """
+    Re-enable FSDP's automatic gradient division.
+
+    TorchTitan calls disable_fsdp_gradient_division() which sets gradient_divide_factor=1.0.
+    This re-enables it by setting the factor to the specified dp_size, so gradients are
+    averaged across FSDP ranks. This is needed for verl's loss scaling (loss * dp_size)
+    to work correctly.
+
+    Args:
+        model: The model (or model part) to enable gradient division on.
+        dp_size: The data parallel size to use as the gradient divide factor.
+    """
+
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.set_gradient_divide_factor(float(dp_size))
+
+
+class ContextParallelGather(torch.autograd.Function):
+    """All-gather along dim 0 whose backward keeps only the local slice.
+
+    Every CP rank computes the same loss on the gathered tensor, so the upstream gradient is
+    identical across CP ranks and its local slice is already the full gradient of the local shard.
+    Summing it across ranks (the default all-gather backward) would scale gradients by the CP size.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, tensor: torch.Tensor, group: torch.distributed.ProcessGroup) -> torch.Tensor:
+        ctx.rank = torch.distributed.get_rank(group)
+        ctx.world_size = torch.distributed.get_world_size(group)
+        tensor = tensor.contiguous()
+        gathered = tensor.new_empty((tensor.size(0) * ctx.world_size, *tensor.shape[1:]))
+        torch.distributed.all_gather_into_tensor(gathered, tensor, group=group)
+        return gathered
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor):
+        return grad_output.chunk(ctx.world_size, dim=0)[ctx.rank], None
 
 
 def extend_torchtitan_engine_config() -> None:
@@ -338,105 +507,53 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucke
         tu.assign_non_tensor_data(mb, "tpu_max_response_len", int(resolved_lens[2 * i + 1]))
 
 
-def make_simple_fsdp_parallelize_fn(parallelize_fn: Any, *, spmd_safe_blocks: bool = False):
-    """Wrap a torchtitan ``parallelize_fn`` so it shards with SimpleFSDP instead of FSDP2.
+def get_tpu_simple_fsdp_parallelize_fn(torchtitan_name: str) -> Callable[..., nn.Module]:
+    """Return torchtitan's TPU recipe ``parallelize_fn`` for ``torchtitan_name``; it shards with SimpleFSDP.
 
-    Mirrors torchtitan's TPU recipes (``experiments/tpu/qwen3/infra/parallelize.py`` with
-    ``parallelism.use_simple_fsdp``): AC and per-block compile are applied by the model's own
-    ``parallelize_fn`` with ``skip_dp=True``, then ``graph_trainer``'s ``apply_simple_fsdp`` turns every
-    parameter into a ``Shard(0)`` DTensor behind a parametrization. Under ``torch.compile`` the FSDP
-    collectives live inside each compiled TransformerBlock, and under activation checkpointing the
-    all-gather is recomputed in backward.
+    With ``ParallelismConfig.use_simple_fsdp`` set, the recipe (``torchtitan/experiments/tpu/<model>/infra/
+    parallelize.py``) wraps the TransformerBlocks with ``spmd_safe``, applies AC and per-block ``torch.compile``
+    through the model's own ``parallelize_fn`` (``skip_dp=True``), picks shard dims that divide evenly, and
+    shards every parameter with ``graph_trainer``'s SimpleFSDP. Under ``torch.compile`` the FSDP collectives
+    live inside each compiled TransformerBlock.
     """
-    from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
-    from torchtitan.experiments.graph_trainer.simple_fsdp import disable_active_parametrization
+    try:
+        module_name, fn_name = _TPU_SIMPLE_FSDP_RECIPES[torchtitan_name]
+    except KeyError:
+        raise ValueError(
+            f"use_simple_fsdp=True needs a torchtitan TPU recipe, and there is none for {torchtitan_name!r} "
+            f"(supported: {sorted(_TPU_SIMPLE_FSDP_RECIPES)}); set use_simple_fsdp=False"
+        ) from None
+    recipe_parallelize_fn = getattr(importlib.import_module(module_name), fn_name)
 
-    def _parallelize(model: nn.Module, *, parallel_dims: Any, training: Any, compile_config: Any, **kwargs: Any):
-        if spmd_safe_blocks and compile_config.enable and hasattr(model, "layers"):
-            from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
-
-            for block in model.layers.values():
-                apply_spmd_safe(block)
-
-        kwargs.pop("skip_dp", None)
-        model = parallelize_fn(
-            model,
-            parallel_dims=parallel_dims,
-            training=training,
-            compile_config=compile_config,
-            skip_dp=True,
-            **kwargs,
-        )
-        tied = bool(getattr(model, "enable_weight_tying", False))
-        model = apply_simple_fsdp(model, parallel_dims=parallel_dims, training=training)
-        if tied:
-            model.tok_embeddings._parameters["weight"] = model.lm_head._parameters["weight"]
-
-        init_weights = model.init_weights
-
-        def _init_weights(*args: Any, **init_kwargs: Any):
-            with disable_active_parametrization():
-                return init_weights(*args, **init_kwargs)
-
-        model.init_weights = _init_weights  # type: ignore[method-assign]
-        logger.info("Applied SimpleFSDP (weight tying preserved: %s, spmd_safe blocks: %s)", tied, spmd_safe_blocks)
+    def _parallelize(model: nn.Module, **kwargs: Any) -> nn.Module:
+        model = recipe_parallelize_fn(model, **kwargs)
+        init_states_without_simple_fsdp_parametrization(model)
         return model
 
     return _parallelize
 
 
-@contextmanager
-def tpu_torchtitan_config_overrides(*, use_simple_fsdp: bool = False):
-    """Force the TorchTitan config values that differ on TPU during ``TorchTitanEngine.__init__``."""
-    from torchtitan.components.optimizer import OptimizersContainer
+def init_states_without_simple_fsdp_parametrization(model: nn.Module) -> None:
+    """Make ``model.init_states`` run with SimpleFSDP's parametrization disabled.
 
-    import verl.workers.engine.torchtitan.transformer_impl as tt_impl
+    torchtitan's ``Trainer`` parallelizes first and initializes second. While the parametrization is active,
+    reading ``.weight`` returns the all-gathered plain tensor, so ``Decoder.init_states`` re-tying
+    ``tok_embeddings.weight = lm_head.weight`` (tied embeddings, e.g. Qwen3 0.6B-4B) raises ``TypeError: cannot
+    assign ... as parameter 'weight'``. With it disabled, the re-tie points both modules at the same sharded
+    parameter (SimpleFSDP shards them separately). torchtitan's graph trainer and HF backend models initialize
+    this way; its TPU qwen3 / llama3 recipes do not yet.
+    """
+    from torchtitan.experiments.graph_trainer import simple_fsdp
 
-    parallelism_cls = getattr(tt_impl, "ParallelismConfig", None)
-    spmd_field = getattr(parallelism_cls, "__dataclass_fields__", {}).get("spmd_backend")
-    default_spmd_backend = getattr(spmd_field, "default", getattr(parallelism_cls, "spmd_backend", "partial_dtensor"))
-    if not isinstance(default_spmd_backend, str):
-        default_spmd_backend = "partial_dtensor"
+    init_states = model.init_states
 
-    forced: list[tuple[Any, str, Any]] = [
-        (OptimizersContainer, "Config", {"implementation": "foreach"}),
-        (tt_impl, "ParallelismConfig", {"spmd_backend": default_spmd_backend}),
-        (tt_impl, "CompileConfig", {"backend": "tpu"}),
-        (tt_impl, "TrainingConfig", {"enable_cpu_offload": False}),
-    ]
+    def _init_states(*args: Any, **kwargs: Any) -> None:
+        # disable_active_parametrization() is not reentrant, so only take it while the parametrization is active.
+        active = simple_fsdp._active_parametrization
+        with simple_fsdp.disable_active_parametrization() if active else nullcontext():
+            init_states(*args, **kwargs)
 
-    saved: list[tuple[Any, str, Any]] = []
-    try:
-        for owner, name, overrides in forced:
-            original = getattr(owner, name)
-            saved.append((owner, name, original))
-
-            def _make(original=original, overrides=overrides):
-                def _construct(*args: Any, **kwargs: Any):
-                    return original(*args, **{**kwargs, **overrides})
-
-                return _construct
-
-            setattr(owner, name, _make())
-
-        if use_simple_fsdp and hasattr(tt_impl, "Trainer") and hasattr(tt_impl.Trainer, "Config"):
-            orig_trainer_cfg_init = tt_impl.Trainer.Config.__init__
-            saved.append((tt_impl.Trainer.Config, "__init__", orig_trainer_cfg_init))
-
-            def _init_trainer_cfg(self_cfg: Any, *args: Any, **kwargs: Any) -> None:
-                orig_trainer_cfg_init(self_cfg, *args, **kwargs)
-                model_spec = getattr(self_cfg, "model_spec", None)
-                if model_spec is not None and hasattr(model_spec, "parallelize_fn"):
-                    model_spec.parallelize_fn = make_simple_fsdp_parallelize_fn(
-                        model_spec.parallelize_fn, spmd_safe_blocks=True
-                    )
-
-            tt_impl.Trainer.Config.__init__ = _init_trainer_cfg  # type: ignore[method-assign]
-
-        yield
-    finally:
-        for owner, name, original in saved:
-            setattr(owner, name, original)
+    model.init_states = _init_states  # type: ignore[method-assign]
 
 
 class TPUVarlenAttention(torch.nn.Module):
@@ -463,7 +580,11 @@ class TPUVarlenAttention(torch.nn.Module):
                 "attention-sink models (e.g. gpt-oss). Supported models must not set it."
             )
 
-        xq, xk, xv = q_BLNH, k_BLNH, v_BLNH
+        was_3d = q_BLNH.dim() == 3
+        if was_3d:
+            xq, xk, xv = q_BLNH.unsqueeze(0), k_BLNH.unsqueeze(0), v_BLNH.unsqueeze(0)
+        else:
+            xq, xk, xv = q_BLNH, k_BLNH, v_BLNH
 
         # Probe the value, not just the attribute name: a mask object can declare the attribute
         # and still leave it unset, in which case the packed path is not applicable.
@@ -505,16 +626,17 @@ class TPUVarlenAttention(torch.nn.Module):
             v = v.repeat_interleave(num_repeat, dim=1)
 
         attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
-        return attn_out.transpose(1, 2)
+        out = attn_out.transpose(1, 2)
+        return out.squeeze(0) if was_3d else out
 
 
 class TPUSplashAttention(torch.nn.Module):
     """TorchTitan inner attention backed by the TPU splash attention Pallas kernel.
 
-    Same contract as ``torchtitan.experiments.tpu.kernels.splash_attention.SplashAttention``
-    ((B, S, H, D) in and out, causal + packed-document masking from ``segment_ids``), but the
-    block sizes are chosen per call from the (static, bucketed) sequence length instead of
-    being fixed at 512. Falls back to the original module if no block size fits.
+    Accepts 3D ``(T, H, D)`` (folded token stream) or 4D ``(B, S, H, D)`` inputs, applying
+    causal + packed-document masking from ``segment_ids``. Block sizes are chosen per call
+    from the (static, bucketed) sequence length instead of being fixed at 512. Falls back
+    to the original module if no block size fits.
     """
 
     def __init__(self, original_module: torch.nn.Module, local_window_size: int | None = None):
@@ -535,7 +657,8 @@ class TPUSplashAttention(torch.nn.Module):
         segment_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        block = splash_block_size_for(int(q.shape[1]))
+        seq_len = int(q.shape[0] if q.dim() == 3 else q.shape[1])
+        block = splash_block_size_for(seq_len)
         if block == 0 or q.device.type == "cpu":
             return self.original_module(
                 q,
@@ -563,6 +686,12 @@ class TPUSplashAttention(torch.nn.Module):
         if segment_ids is None and positions is not None:
             segment_ids = segment_ids_from_positions(positions)
 
+        was_3d = q.dim() == 3
+        if was_3d:
+            q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+        if segment_ids is not None and segment_ids.dim() == 1:
+            segment_ids = segment_ids.unsqueeze(0)
+
         out = splash_sdpa(
             q.transpose(1, 2).contiguous(),
             k.transpose(1, 2).contiguous(),
@@ -580,6 +709,8 @@ class TPUSplashAttention(torch.nn.Module):
             block_kv_dkv=block,
             block_kv_dkv_compute=block,
         ).transpose(1, 2)
+        if was_3d:
+            out = out.squeeze(0)
         if q_mesh is not None:
             out = DTensor.from_local(out, q_mesh, q_placements)
         return out
@@ -600,6 +731,8 @@ def apply_splash_attention_tpu(modules: Any) -> int:
     """
     if modules is None:
         return 0
+    from torchtitan.models.common.attention import VarlenInnerAttention
+
     model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
     replaced = 0
     already_splash = 0
@@ -619,7 +752,8 @@ def apply_splash_attention_tpu(modules: Any) -> int:
             local_window_size = None
             if isinstance(window, tuple) and len(window) == 2 and window[0] >= 0:
                 local_window_size = int(window[0])
-            fallback = TPUVarlenAttention() if type(inner).__name__ == "VarlenAttention" else inner
+            # torchtitan's VarlenInnerAttention calls the CUDA flash-attention varlen op, which TPU lacks.
+            fallback = TPUVarlenAttention() if isinstance(inner, VarlenInnerAttention) else inner
             module.inner_attention = TPUSplashAttention(fallback, local_window_size=local_window_size)
             replaced += 1
     if saw_nn_module and replaced == 0 and already_splash == 0:
@@ -647,38 +781,6 @@ def replace_varlen_attention_with_tpu_attention(modules: Any) -> int:
     return replaced
 
 
-def force_sum_reduction_on_all_fsdp_modules(modules: Any) -> int:
-    """Enable ``set_force_sum_reduction_for_comms(True)`` on every FSDP2-wrapped module.
-
-    ``tpu_dist`` does not implement ``ReduceOp.AVG`` or ``ReduceOp.PREMUL_SUM`` in
-    ``reduce_scatter`` / ``all_reduce``. When TorchTitan shards with FSDP2 (instead of
-    ``SimpleFSDP``), ``fully_shard`` wraps both individual ``TransformerBlock`` layers
-    and the root model, and ``enable_fsdp_gradient_division`` causes FSDP2's
-    ``_get_gradient_divide_factors`` to select ``ReduceOp.AVG`` / ``ReduceOp.PREMUL_SUM``
-    unless ``set_force_sum_reduction_for_comms(True)`` is set on each wrapped module.
-    No-op (returns 0) when ``SimpleFSDP`` or unsharded modules are used.
-    """
-    if modules is None:
-        return 0
-    model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
-    seen: set[int] = set()
-    count = 0
-    for root in model_list:
-        if not isinstance(root, torch.nn.Module):
-            continue
-        for mod in (root, *root.modules()):
-            if id(mod) in seen:
-                continue
-            seen.add(id(mod))
-            fn = getattr(mod, "set_force_sum_reduction_for_comms", None)
-            if callable(fn):
-                fn(True)
-                count += 1
-    if count:
-        logger.info("Enabled force_sum_reduction_for_comms on %d FSDP module(s) for TPU", count)
-    return count
-
-
 def pad_packed_inputs_for_tpu(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
@@ -693,15 +795,12 @@ def pad_packed_inputs_for_tpu(
     from ``positions``) the dense mask is skipped and ``None`` is returned in its place.
     """
     step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
-    input_ids_cpu = input_ids.values().detach().cpu().unsqueeze(0)
-    if position_ids.dim() == 3:
-        position_ids_cpu = position_ids.values().detach().cpu().unsqueeze(1)
-    else:
-        position_ids_cpu = position_ids.values().detach().cpu().unsqueeze(0)
+    input_ids_cpu = input_ids.values().detach().cpu()
+    position_ids_cpu = position_ids.values().detach().cpu()
 
-    labels_cpu = torch.roll(input_ids_cpu, shifts=-1, dims=1)
+    labels_cpu = torch.roll(input_ids_cpu, shifts=-1, dims=0)
 
-    orig_seq_len = int(input_ids_cpu.shape[1])
+    orig_seq_len = int(input_ids_cpu.shape[-1])
     # tpu_padded_seq_len: common length across ranks from align_micro_batch_shapes_across_ranks (SimpleFSDP).
     padded_seq_len = max(
         bucket_length(orig_seq_len, step),
@@ -709,7 +808,7 @@ def pad_packed_inputs_for_tpu(
     )
     pad_len = padded_seq_len - orig_seq_len
 
-    pos_2d_cpu = position_ids_cpu[0] if position_ids_cpu.dim() == 3 else position_ids_cpu
+    pos_2d_cpu = position_ids_cpu[0].unsqueeze(0) if position_ids_cpu.dim() == 2 else position_ids_cpu.unsqueeze(0)
     if pad_len > 0:
         input_ids_cpu = F.pad(input_ids_cpu, (0, pad_len), value=0)
         labels_cpu = F.pad(labels_cpu, (0, pad_len), value=0)
