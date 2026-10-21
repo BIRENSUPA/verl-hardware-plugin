@@ -782,12 +782,14 @@ class TestReduceAvgPatchWiring:
             mock.patch("verl_hardware_plugin.accelerators.xpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply,
             mock.patch("verl_hardware_plugin.accelerators.xpu.patches.ray_device_pin_patch.apply") as fake_pin_apply,
             mock.patch("verl_hardware_plugin.accelerators.xpu.profilers.register_vtune.apply") as fake_vtune_apply,
+            mock.patch("verl_hardware_plugin.accelerators.xpu.patches.numa_affinity_patch.apply") as fake_numa_apply,
         ):
             PlatformXPU()
 
         fake_apply.assert_called_once()
         fake_pin_apply.assert_called_once()
         fake_vtune_apply.assert_called_once()
+        fake_numa_apply.assert_called_once()
 
     def test_platform_tpu_init_applies_patches(self):
         with mock.patch("verl_hardware_plugin.accelerators.tpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply:
