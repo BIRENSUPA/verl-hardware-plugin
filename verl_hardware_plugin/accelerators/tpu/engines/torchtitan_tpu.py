@@ -83,6 +83,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     tpu_synchronize,
     unwrap_metadata,
 )
+from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -748,7 +749,11 @@ class TorchTitanTPUEngine(BaseEngine):
         return [(hf_template.format(layer_id, e), slot_shape) for e in range(int(param.shape[0]))]
 
     def get_per_tensor_param(self, **kwargs):
-        """Yield HF-named parameters cast to ``bfloat16`` before ``DTensor.full_tensor()`` all-gather."""
+        """HF-named parameters cast to ``bfloat16``, as a single-use ``TrainerWeights``.
+
+        Iterating it all-gathers every DTensor (``DTensor.full_tensor()``) after the cast; ``local_shards()`` exports
+        this rank's FSDP shards without the gather where the receiver can place them.
+        """
         if self._is_offload_param:
             self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
@@ -768,35 +773,11 @@ class TorchTitanTPUEngine(BaseEngine):
         dense = self._to_hf_named_params({k: v for k, v in params.items() if k not in stacks})
         params.clear()
 
-        device = get_device_id()
-
-        def _gen():
-            gathered_tied: dict[int, torch.Tensor] = {}
-            for name in list(dense.keys()):
-                param = dense.pop(name)
-                if isinstance(param, DTensor):
-                    pid = id(param)
-                    full = gathered_tied.get(pid)
-                    if full is None:
-                        full = param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
-                        if name in ("model.embed_tokens.weight", "lm_head.weight"):
-                            gathered_tied[pid] = full
-                    yield name, full
-                    del full
-                else:
-                    yield name, param.to(torch.bfloat16, non_blocking=True)
-                del param
-            gathered_tied.clear()
-            for stack, slots in expert_stacks:
-                full = stack.to(device, non_blocking=True)
-                if isinstance(full, DTensor):
-                    full = full.full_tensor()
-                full = full.to(torch.bfloat16, non_blocking=True)
-                for e, (hf_name, _shape) in enumerate(slots):
-                    yield hf_name, full[e].clone()
-                del full
-
-        return _gen(), None
+        # q/k/v_proj arrive here replicated, but not for free: torchtitan's FusedQKVLinear (fuse_qkv=True) keeps
+        # wqkv FSDP sharded, and its state_dict() hook (_split_qkv_on_save) all-gathers it to Replicate() before
+        # splitting it into q/k/v; see weight_export.fsdp_dim0_shard.
+        # TODO(tpu): split wqkv locally on save (or train with fuse_qkv=False) so q/k/v export as local shards.
+        return TrainerWeights(dense, expert_stacks, get_device_id()), None
 
 
 @EngineRegistry.register(

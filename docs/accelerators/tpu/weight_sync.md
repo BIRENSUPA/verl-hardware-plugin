@@ -19,11 +19,22 @@ The driver runs each sync (`update_raiden_weights`, which replaces `CheckpointEn
 for this backend):
 
 1. It pauses generation. The initial sync at step 0 skips this.
-2. Every trainer rank binds the full weights, which verl gathers on every rank, to its tpu-sync
-   `WeightSynchronizer`. On the first sync it creates that synchronizer and registers it with the Raiden
-   controller, which the driver starts at the same time; later syncs rebind the new tensors to the existing
-   synchronizer, as long as the tensor names, shapes and dtypes do not change. The trainer also publishes the
-   full shape of every tensor in the `RayWeightRegistry` actor.
+2. Every trainer rank binds its weights to its tpu-sync `WeightSynchronizer`
+   (`engines/weight_export.py` decides how each weight is exported):
+   - an FSDP shard (`Shard(0)` on a 1-D mesh, dim 0 divisible by the mesh size) is registered as this rank's
+     block of the full tensor; Raiden reshards the blocks of all ranks for the rollout, so no rank gathers it;
+   - a replicated weight is already full on every rank and is registered full, without further communication.
+     Note that q/k/v_proj are replicated only because torchtitan's `FusedQKVLinear` `state_dict()` hook already
+     all-gathers the FSDP-sharded `wqkv` before splitting it (TODO: split it locally);
+   - every other layout (uneven cuts, FSDP x TP or HSDP 2-D meshes, fused expert stacks) is all-gathered and
+     registered full. Each such tensor is logged at INFO, with a per-sync summary line.
+
+   On the first sync it creates that synchronizer and registers it with the Raiden controller, which the
+   driver starts at the same time; later syncs rebind the new tensors to the existing synchronizer, as long as
+   the tensor names, shapes, dtypes and shard layout do not change. The trainer also publishes the full shape
+   of every tensor in the job's `TpuSyncRendezvous` actor (`engines/tpu_sync_rendezvous.py`). The driver
+   creates that actor once per job, named after the Ray job and not detached, so jobs sharing a cluster never
+   see each other's.
 3. On the first sync only, every rollout worker allocates tensor-parallel receive buffers of those shapes
    and registers them.
 4. The controller moves the weights from the trainer chips, through the trainer hosts, to the rollout hosts.
